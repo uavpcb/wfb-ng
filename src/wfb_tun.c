@@ -37,6 +37,88 @@
 #define MTU 1445
 #define PING_INTERVAL_MS 500
 
+// Mesh relay: dedup cache size (sliding window)
+#define RELAY_DEDUP_SIZE 256
+
+// Mesh relay: originator table size and direct-reachability timeout
+#define RELAY_ORIG_SIZE 64
+#define RELAY_DIRECT_TIMEOUT_MS 3000  // Skip relay if dst seen within this window
+
+#include <time.h>
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+// Mesh relay state
+static int relay_enabled = 0;
+static uint32_t local_ip_nbo = 0;  // our IP in network byte order
+static struct { uint32_t src; uint16_t id; uint8_t in_use; } relay_dedup[RELAY_DEDUP_SIZE];
+static int relay_dedup_pos = 0;
+
+// Originator table: when we last heard a packet directly from this src.
+// Used to decide whether to relay a packet TO this src's IP.
+static struct { uint32_t ip; uint64_t last_heard_ms; uint8_t in_use; } relay_origs[RELAY_ORIG_SIZE];
+
+static uint64_t relay_count_sent = 0;
+static uint64_t relay_count_dropped_seen = 0;
+static uint64_t relay_count_dropped_direct = 0;
+
+static int relay_seen(uint32_t src, uint16_t ip_id)
+{
+    for (int i = 0; i < RELAY_DEDUP_SIZE; i++) {
+        if (relay_dedup[i].in_use &&
+            relay_dedup[i].src == src &&
+            relay_dedup[i].id == ip_id)
+            return 1;
+    }
+    relay_dedup[relay_dedup_pos].src = src;
+    relay_dedup[relay_dedup_pos].id = ip_id;
+    relay_dedup[relay_dedup_pos].in_use = 1;
+    relay_dedup_pos = (relay_dedup_pos + 1) % RELAY_DEDUP_SIZE;
+    return 0;
+}
+
+// Record that we heard a packet from this source. Called on every RX.
+static void relay_note_heard(uint32_t ip, uint64_t now_ms)
+{
+    // Update existing entry
+    for (int i = 0; i < RELAY_ORIG_SIZE; i++) {
+        if (relay_origs[i].in_use && relay_origs[i].ip == ip) {
+            relay_origs[i].last_heard_ms = now_ms;
+            return;
+        }
+    }
+    // Add new: find empty or replace oldest
+    int oldest_idx = 0;
+    uint64_t oldest_t = UINT64_MAX;
+    for (int i = 0; i < RELAY_ORIG_SIZE; i++) {
+        if (!relay_origs[i].in_use) { oldest_idx = i; break; }
+        if (relay_origs[i].last_heard_ms < oldest_t) {
+            oldest_t = relay_origs[i].last_heard_ms;
+            oldest_idx = i;
+        }
+    }
+    relay_origs[oldest_idx].ip = ip;
+    relay_origs[oldest_idx].last_heard_ms = now_ms;
+    relay_origs[oldest_idx].in_use = 1;
+}
+
+// Is destination dst IP reachable directly (heard recently)?
+static int relay_dst_reachable_directly(uint32_t ip, uint64_t now_ms)
+{
+    for (int i = 0; i < RELAY_ORIG_SIZE; i++) {
+        if (relay_origs[i].in_use && relay_origs[i].ip == ip) {
+            if (now_ms - relay_origs[i].last_heard_ms < RELAY_DIRECT_TIMEOUT_MS)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static struct event_base *ev_base;
 static struct event *ev_ping;
 static struct event *ev_tun_read;
@@ -285,6 +367,92 @@ void ev_socket_read_cb(evutil_socket_t fd, short flags, void *arg)
         return;
     }
 
+    // Mesh relay: inspect each packet in the batch.
+    // Reinject packets that are not for us, haven't been seen before,
+    // and have TTL > 1. Sends them back via socket to wfb_tx.
+    if (relay_enabled)
+    {
+        char relay_out[MTU];
+        size_t relay_out_size = 0;
+        size_t off = 0;
+        uint64_t now_ms = monotonic_ms();
+
+        while (off + sizeof(tun_packet_hdr_t) <= (size_t)nread)
+        {
+            uint16_t psize = ntohs(((tun_packet_hdr_t*)(buf->data + off))->packet_size);
+            if (off + sizeof(tun_packet_hdr_t) + psize > (size_t)nread)
+                break;
+
+            uint8_t *pkt = (uint8_t*)(buf->data + off + sizeof(tun_packet_hdr_t));
+
+            // Only handle IPv4
+            if (psize >= 20 && (pkt[0] >> 4) == 4)
+            {
+                uint32_t src, dst;
+                memcpy(&src, pkt + 12, 4);
+                memcpy(&dst, pkt + 16, 4);
+                uint16_t ip_id = ntohs(*(uint16_t*)(pkt + 4));
+                uint8_t ttl = pkt[8];
+
+                // Note: we heard this src (for future relay decisions)
+                if (src != local_ip_nbo)
+                    relay_note_heard(src, now_ms);
+
+                // Relay rules:
+                //  - source is not me (skip own echo)
+                //  - destination is not me (I keep it, not relay)
+                //  - TTL > 1 (at least one hop left)
+                //  - haven't seen (src, ip_id) before
+                //  - destination not reachable directly by us (don't relay if dst is known direct)
+                if (src != local_ip_nbo && dst != local_ip_nbo &&
+                    ttl > 1 && !relay_seen(src, ip_id) &&
+                    !relay_dst_reachable_directly(dst, now_ms))
+                {
+                    if (relay_out_size + sizeof(tun_packet_hdr_t) + psize <= MTU)
+                    {
+                        tun_packet_hdr_t *h = (tun_packet_hdr_t*)(relay_out + relay_out_size);
+                        h->packet_size = htons(psize);
+                        uint8_t *dp = (uint8_t*)(relay_out + relay_out_size + sizeof(tun_packet_hdr_t));
+                        memcpy(dp, pkt, psize);
+
+                        // Decrement TTL and recompute IP header checksum
+                        dp[8]--;
+                        uint8_t ihl = (dp[0] & 0x0f) * 4;
+                        if (ihl <= psize) {
+                            uint16_t *csum = (uint16_t*)(dp + 10);
+                            *csum = 0;
+                            uint32_t s = 0;
+                            for (int i = 0; i + 1 < ihl; i += 2)
+                                s += ntohs(*(uint16_t*)(dp + i));
+                            while (s >> 16) s = (s & 0xffff) + (s >> 16);
+                            *csum = htons(~s & 0xffff);
+                        }
+
+                        relay_out_size += sizeof(tun_packet_hdr_t) + psize;
+                        relay_count_sent++;
+                    }
+                }
+                else if (src != local_ip_nbo && dst != local_ip_nbo && ttl > 1)
+                {
+                    // Either seen already or dst reachable directly
+                    if (relay_dst_reachable_directly(dst, now_ms))
+                        relay_count_dropped_direct++;
+                    else
+                        relay_count_dropped_seen++;
+                }
+            }
+
+            off += sizeof(tun_packet_hdr_t) + psize;
+        }
+
+        if (relay_out_size > 0)
+        {
+            ssize_t sent = sendto(fd, relay_out, relay_out_size, 0,
+                                  (struct sockaddr*)&peer_addr, sizeof(peer_addr));
+            (void)sent;
+        }
+    }
+
     buf->offset = 0;
     buf->data_size = nread;
 
@@ -413,7 +581,7 @@ int main (int argc, char *argv[])
     peer_addr.sin_addr.s_addr = htonl(0x7f000001); // 127.0.0.1
     peer_addr.sin_port = htons(5801);
 
-    while ((opt = getopt(argc, argv, "t:c:u:l:a:T:h")) != -1)
+    while ((opt = getopt(argc, argv, "t:c:u:l:a:T:Rh")) != -1)
     {
         switch (opt)
         {
@@ -445,11 +613,35 @@ int main (int argc, char *argv[])
             bind_port = atoi(optarg);
             break;
 
+        case 'R':
+            relay_enabled = 1;
+            break;
+
         default: /* '?' */
-            fprintf(stderr, "Usage: %s [-t tun_name] [-a tun_addr] [-c peer_addr] [-u peer_port] [-l listen_port] [-T agg_timeout_ms] \n", argv[0]);
+            fprintf(stderr, "Usage: %s [-t tun_name] [-a tun_addr] [-c peer_addr] [-u peer_port] [-l listen_port] [-T agg_timeout_ms] [-R]\n", argv[0]);
             fprintf(stderr, "Default: tun_name=%s, tun_addr=%s, peer_addr=127.0.0.1, peer_port=5801, listen_port=%d, agg_timeout_ms=%u\n", tun_name, tun_addr, bind_port, agg_timeout_ms);
+            fprintf(stderr, "  -R  Enable mesh relay (reinject packets not destined to our IP, TTL-limited, dedup)\n");
             fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
             fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
+            return 1;
+        }
+    }
+
+    // Parse local IP from tun_addr (strip /prefix) for relay dedup
+    if (relay_enabled && tun_addr != NULL)
+    {
+        char ip_str[64];
+        strncpy(ip_str, tun_addr, sizeof(ip_str) - 1);
+        ip_str[sizeof(ip_str) - 1] = 0;
+        char *slash = strchr(ip_str, '/');
+        if (slash) *slash = 0;
+        struct in_addr a;
+        if (inet_pton(AF_INET, ip_str, &a) == 1) {
+            local_ip_nbo = a.s_addr;
+            fprintf(stderr, "wfb_tun: relay enabled, local IP = %s (0x%08x)\n",
+                    ip_str, ntohl(local_ip_nbo));
+        } else {
+            fprintf(stderr, "wfb_tun: could not parse tun_addr '%s' for relay\n", tun_addr);
             return 1;
         }
     }
