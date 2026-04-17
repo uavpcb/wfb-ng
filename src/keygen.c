@@ -27,25 +27,82 @@
 #include <sys/ioctl.h>
 #include <linux/random.h>
 
+int generate_symmetric_key(char *password);
+int generate_asymmetric_keys(char *password);
+
 int main(int argc, char** argv)
+{
+    int symmetric = 0;
+    char *password = NULL;
+
+    if (argc >= 2 && strcmp(argv[1], "-s") == 0)
+    {
+        symmetric = 1;
+        if (argc == 3) password = argv[2];
+        else if (argc > 3) { fprintf(stderr, "Usage: %s -s [password]\n", argv[0]); return 1; }
+    }
+    else if (argc == 2)
+    {
+        password = argv[1];
+    }
+    else if (argc > 2)
+    {
+        fprintf(stderr, "Usage: %s [-s] [password]\n", argv[0]);
+        return 1;
+    }
+
+    if (symmetric)
+        return generate_symmetric_key(password);
+    else
+        return generate_asymmetric_keys(password);
+}
+
+int generate_symmetric_key(char *password)
+{
+    unsigned char key[crypto_secretbox_KEYBYTES];
+    FILE *fp;
+
+    if (sodium_init() < 0) { fprintf(stderr, "Libsodium init failed\n"); return 1; }
+
+    if (password != NULL)
+    {
+        unsigned char salt[crypto_pwhash_argon2i_SALTBYTES] =
+            {'w','i','f','i','b','r','o','a','d','c','a','s','t','k','e','y'};
+        if (crypto_pwhash_argon2i(key, sizeof(key), password, strlen(password), salt,
+                                  crypto_pwhash_argon2i_OPSLIMIT_INTERACTIVE,
+                                  crypto_pwhash_argon2i_MEMLIMIT_INTERACTIVE,
+                                  crypto_pwhash_ALG_ARGON2I13) != 0)
+        {
+            fprintf(stderr, "Unable to derive key from password\n");
+            return 1;
+        }
+        fprintf(stderr, "Symmetric key derived from password\n");
+    }
+    else
+    {
+        randombytes_buf(key, sizeof(key));
+        fprintf(stderr, "Symmetric key generated from random\n");
+    }
+
+    if ((fp = fopen("net.key", "w")) == NULL)
+    {
+        perror("Unable to save net.key");
+        return 1;
+    }
+    fwrite(key, crypto_secretbox_KEYBYTES, 1, fp);
+    fclose(fp);
+
+    fprintf(stderr, "Shared key saved to net.key (32 bytes)\n");
+    return 0;
+}
+
+int generate_asymmetric_keys(char *password)
 {
     unsigned char drone_publickey[crypto_box_PUBLICKEYBYTES];
     unsigned char drone_secretkey[crypto_box_SECRETKEYBYTES];
     unsigned char gs_publickey[crypto_box_PUBLICKEYBYTES];
     unsigned char gs_secretkey[crypto_box_SECRETKEYBYTES];
     FILE *fp;
-    char *password = NULL;
-
-    if(argc == 2)
-    {
-        password = argv[1];
-    }
-
-    if(argc > 2)
-    {
-        fprintf(stderr, "Usage: %s [password]\n", argv[0]);
-        return 1;
-    }
 
     // check for enough entropy and warn if sodium_init() can freeze
     {

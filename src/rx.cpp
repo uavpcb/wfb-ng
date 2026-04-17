@@ -281,15 +281,10 @@ Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_i
     {
         throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
     }
-    if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+    if (fread(shared_key, crypto_secretbox_KEYBYTES, 1, fp) != 1)
     {
         fclose(fp);
-        throw runtime_error(string_format("Unable to read rx secret key: %s", strerror(errno)));
-    }
-    if (fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read tx public key: %s", strerror(errno)));
+        throw runtime_error(string_format("Unable to read shared key: %s", strerror(errno)));
     }
     fclose(fp);
 }
@@ -571,7 +566,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                                 const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth, sockaddr_in *sockaddr)
 {
-    uint8_t session_tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
+    uint8_t session_tmp[MAX_SESSION_PACKET_SIZE - crypto_secretbox_MACBYTES - sizeof(wsession_hdr_t)];
     uint8_t new_session_hash[sizeof(session_hash)];
 
     wsession_data_t* new_session_data = NULL;
@@ -603,7 +598,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
     case WFB_PACKET_SESSION:
         new_session_data = (wsession_data_t*)session_tmp;
 
-        if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES || \
+        if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_secretbox_MACBYTES || \
            size > MAX_SESSION_PACKET_SIZE)
         {
             WFB_ERR("Invalid session key packet\n");
@@ -629,18 +624,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
             return;
         }
 
-        if(crypto_box_open_easy((uint8_t*)session_tmp,
-                                buf + sizeof(wsession_hdr_t),
-                                size - sizeof(wsession_hdr_t),
-                                ((wsession_hdr_t*)buf)->session_nonce,
-                                tx_publickey, rx_secretkey) != 0)
+        if(crypto_secretbox_open_easy((uint8_t*)session_tmp,
+                                     buf + sizeof(wsession_hdr_t),
+                                     size - sizeof(wsession_hdr_t),
+                                     ((wsession_hdr_t*)buf)->session_nonce,
+                                     shared_key) != 0)
         {
             WFB_ERR("Unable to decrypt session key\n");
             count_p_dec_err += 1;
             return;
         }
 
-        //new_session_tags_size = size - (sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES);
+        //new_session_tags_size = size - (sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_secretbox_MACBYTES);
 
         if (be64toh(new_session_data->epoch) < epoch)
         {

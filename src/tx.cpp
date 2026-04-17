@@ -55,8 +55,7 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     epoch(epoch),
     channel_id(channel_id),
     fec_delay(fec_delay),
-    tx_secretkey{},
-    rx_publickey{},
+    shared_key{},
     session_key{},
     session_packet{},
     session_packet_size(0),
@@ -68,15 +67,10 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
     {
         throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
     }
-    if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+    if (fread(shared_key, crypto_secretbox_KEYBYTES, 1, fp) != 1)
     {
         fclose(fp);
-        throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
-    }
-    if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
-    {
-        fclose(fp);
-        throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
+        throw runtime_error(string_format("Unable to read shared key: %s", strerror(errno)));
     }
     fclose(fp);
 
@@ -150,7 +144,7 @@ void Transmitter::init_session(int k, int n)
 
     // fill packet contents
 
-    uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
+    uint8_t tmp[MAX_SESSION_PACKET_SIZE - crypto_secretbox_MACBYTES - sizeof(wsession_hdr_t)];
 
     // Fill fixed headers
     {
@@ -181,14 +175,14 @@ void Transmitter::init_session(int k, int n)
         memcpy(tlv->value, &it->value[0], it->value.size());
     }
 
-    if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
-                        (uint8_t*)tmp, session_data_size,
-                        session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
+    if (crypto_secretbox_easy(session_packet + sizeof(wsession_hdr_t),
+                              (uint8_t*)tmp, session_data_size,
+                              session_hdr->session_nonce, shared_key) != 0)
     {
         throw runtime_error("Unable to make session key!");
     }
 
-    session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
+    session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_secretbox_MACBYTES;
     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
 }
 

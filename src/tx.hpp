@@ -103,9 +103,8 @@ private:
     const uint32_t channel_id; // (link_id << 8) + port_number
     const uint32_t fec_delay; // fec packet delay [us]
 
-    // tx->rx keypair
-    uint8_t tx_secretkey[crypto_box_SECRETKEYBYTES];
-    uint8_t rx_publickey[crypto_box_PUBLICKEYBYTES];
+    // shared symmetric key (for crypto_secretbox)
+    uint8_t shared_key[crypto_secretbox_KEYBYTES];
     uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];
     uint8_t session_packet[MAX_SESSION_PACKET_SIZE];
     uint16_t session_packet_size;
